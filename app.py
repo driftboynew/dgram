@@ -13,17 +13,25 @@ Setup:
 """
 
 import os
+import io
 import html
 import threading
+import tempfile
 from datetime import datetime
-from flask import Flask, request, session, redirect
+from flask import Flask, request, session, redirect, send_file, Response
 from telethon.sync import TelegramClient
+from telethon.tl.types import DocumentAttributeAudio
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
     PasswordHashInvalidError,
 )
+try:
+    from gtts import gTTS
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -358,7 +366,20 @@ def chat(chat_id):
 
         txt = safe_text(getattr(m, 'message', '') or '', 300)
         if not txt:
-            txt = '<em>[media / sticker]</em>'
+            # Check if it's a voice/audio message — show download link
+            if hasattr(m, 'media') and m.media:
+                try:
+                    doc = getattr(m.media, 'document', None)
+                    if doc:
+                        for attr in doc.attributes:
+                            if isinstance(attr, DocumentAttributeAudio):
+                                dur = attr.duration or 0
+                                txt = f'<a href="/voice/{chat_id}/{m.id}">&#9660; Voice ({dur}s) - tap to download</a>'
+                                break
+                except Exception:
+                    pass
+            if not txt:
+                txt = '<em>[media / sticker]</em>'
 
         is_me = (m.sender_id == me.id)
         cls = 'msg-out' if is_me else 'msg-in'
@@ -387,12 +408,14 @@ def chat(chat_id):
     if len(messages) == limit:
         older_link = f'<a href="/chat/{chat_id}?offset={offset+limit}">&#8593; Older messages</a>'
 
-    # Reply form
+    # Reply form — text + optional TTS voice
+    tts_btn = '<input type="submit" name="action" value="Voice &#9835;"/>' if TTS_AVAILABLE else ''
     form = f"""
 <form method="post" action="/chat/{chat_id}/send">
   <label>Message:</label>
   <textarea name="msg" placeholder="Type a message..."></textarea>
-  <input type="submit" value="Send &#9654;"/>
+  <input type="submit" name="action" value="Send &#9654;"/>
+  {tts_btn}
 </form>"""
 
     body = f"""
@@ -413,6 +436,7 @@ def send_message(chat_id):
         return redirect('/login')
 
     msg_text = request.form.get('msg', '').strip()
+    action   = request.form.get('action', 'Send')
     if not msg_text:
         return redirect(f'/chat/{chat_id}')
 
@@ -421,15 +445,52 @@ def send_message(chat_id):
         entity = _dialog_cache.get(chat_id)
         if entity is None:
             entity = c.get_entity(int(chat_id))
-        c.send_message(entity, msg_text)
+
+        if 'Voice' in action and TTS_AVAILABLE:
+            # Convert text to speech and send as voice note
+            tts = gTTS(text=msg_text, lang='en')
+            buf = io.BytesIO()
+            tts.write_to_fp(buf)
+            buf.seek(0)
+            buf.name = 'voice.mp3'
+            c.send_file(entity, buf, voice_note=True,
+                        attributes=[DocumentAttributeAudio(
+                            duration=0, voice=True)])
+        else:
+            c.send_message(entity, msg_text)
+
     except Exception as e:
-        # Show error but go back to chat
         body = f"""
 <div class="err">Failed to send: {html.escape(str(e))}</div>
 <a href="/chat/{chat_id}">&#8592; Back to chat</a>"""
         return page('Send Error', body)
 
     return redirect(f'/chat/{chat_id}')
+
+
+# ── Download voice/audio message ───────────────────────────────────────────────
+
+@app.route('/voice/<chat_id>/<int:msg_id>')
+def download_voice(chat_id, msg_id):
+    """Download a voice/audio message as MP3 so Nokia media player can open it."""
+    if not is_authed():
+        return redirect('/login')
+    try:
+        c = get_client()
+        entity = _dialog_cache.get(chat_id)
+        if entity is None:
+            entity = c.get_entity(int(chat_id))
+        msgs = c.get_messages(entity, ids=msg_id)
+        msg  = msgs if not isinstance(msgs, list) else (msgs[0] if msgs else None)
+        if msg is None or not msg.media:
+            return 'No media', 404
+        buf = io.BytesIO()
+        c.download_media(msg, file=buf)
+        buf.seek(0)
+        return Response(buf.read(), mimetype='audio/mpeg',
+                        headers={'Content-Disposition': f'attachment; filename="voice_{msg_id}.mp3"'})
+    except Exception as e:
+        return f'Error: {html.escape(str(e))}', 500
 
 
 # ── Search ─────────────────────────────────────────────────────────────────────
